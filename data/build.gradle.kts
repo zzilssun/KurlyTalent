@@ -13,6 +13,12 @@ android {
 dependencies {
     implementation(project(":domain"))
 
+    // WorkManager
+    implementation(libs.work.runtime.ktx)
+
+    // Location
+    implementation(libs.location)
+
     // Hilt
     implementation(libs.hilt.android)
     ksp(libs.hilt.android.compiler)
@@ -22,4 +28,7 @@ dependencies {
     // Room (Bundle 사용)
     implementation(libs.bundles.room)
     ksp(libs.room.compiler)
+
+    // Kotlin
+    implementation(libs.kotlinx.coroutines.play.services)
 }

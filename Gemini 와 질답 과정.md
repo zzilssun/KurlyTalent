@@ -593,3 +593,355 @@ abstract class RepositoryModule {
 이 구조를 통해 각 모듈의 책임이 명확히 분리되었고, 의존성 규칙도 준수하게 되었습니다.
 
 다음으로 UseCase를 구현하거나 `feature` 모듈의 ViewModel을 구현해 볼까요?
+
+---
+
+# 질문 4
+위치를 가져와서 DB 에 업데이트 시키는 로직을 구현하자
+위치 관련 퍼미션 체크와 퍼미션 체크 이후 위치를 가져와서 디비에 기록을 하는 코드를 구현해야해
+위치를 가져올때는 WorkManager 를 통해서 가져와야하고 이후 위치를 가져오게 되면 디비에 기록을 해줘
+만약 위치 정보를 가져오다가 오류가 나게 되면 에러 팝업을 띄울건데 throw 로 에러를 전달하면 돼
+
+# 답변 4
+알겠습니다. 요구사항에 맞춰 **WorkManager**를 사용해 백그라운드에서 위치를 가져오고, Room DB에 저장하는 로직을 구현해 보겠습니다.
+
+말씀하신 대로 `feature` 모듈의 UI(Composable)에서 권한을 요청하고, ViewModel이 이 결과를 받아 `WorkManager`를 실행시키며, `WorkManager`가 `data` 모듈의 Repository를 통해 DB에 저장하는 흐름으로 구성합니다.
+
+오류 발생 시 `WorkManager`가 예외를 throw 하도록 하여 `WorkInfo`의 상태가 `FAILED`가 되도록 처리하고, ViewModel이 이를 감지하여 `Effect`로 에러 팝업을 띄우도록 하겠습니다.
+
+-----
+
+## 0\. 필요한 라이브러리 추가
+
+먼저 `app` 모듈의 `build.gradle.kts`에 Hilt-WorkManager를, `data` 모듈에 WorkManager와 Play Services Location을 추가해야 합니다.
+
+**`app/build.gradle.kts`**
+
+```kotlin
+// ...
+dependencies {
+    // ...
+    // Hilt WorkManager 통합
+    implementation("androidx.hilt:hilt-work:1.2.0")
+    kapt("androidx.hilt:hilt-compiler:1.2.0")
+}
+```
+
+**`data/build.gradle.kts`**
+
+```kotlin
+// ...
+dependencies {
+    // ...
+    // WorkManager (Coroutine 지원)
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    // Google Play Services: Location
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+    
+    // Coroutine Play Services (Task를 suspend 함수로 변환)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+}
+```
+
+-----
+
+## 1\. `app` 모듈 (Application 설정)
+
+Hilt-WorkManager를 사용하기 위해 `Application` 클래스가 `Configuration.Provider`를 구현해야 합니다.
+
+**`app/src/main/java/com/example/kurlytalent/KurlyApplication.kt`**
+
+```kotlin
+package com.example.kurlytalent
+
+import android.app.Application
+import androidx.hilt.work.HiltWorkerFactory
+import androidx.work.Configuration
+import dagger.hilt.android.HiltAndroidApp
+import javax.inject.Inject
+
+@HiltAndroidApp
+class KurlyApplication : Application(), Configuration.Provider {
+
+    @Inject
+    lateinit var workerFactory: HiltWorkerFactory
+
+    override fun getWorkManagerConfiguration(): Configuration =
+        Configuration.Builder()
+            .setWorkerFactory(workerFactory)
+            .build()
+}
+```
+
+-----
+
+## 2\. `data` 모듈 (WorkManager 및 Service 구현)
+
+### 2-1. LocationWorker (WorkManager)
+
+Hilt를 통해 `LocationRepository`와 `FusedLocationProviderClient`를 주입받는 `CoroutineWorker`입니다.
+
+```kotlin
+// data/src/main/java/com/example/kurlytalent/data/worker/LocationWorker.kt
+
+package com.example.kurlytalent.data.worker
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import androidx.hilt.work.HiltWorker
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.example.kurlytalent.domain.repository.LocationRepository
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.Priority
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedInject
+import kotlinx.coroutines.tasks.await
+import java.io.IOException
+
+// 사용자 정의 예외
+class LocationPermissionException : IOException("위치 권한이 없습니다.")
+class LocationFetchException : IOException("위치 정보를 가져오는 데 실패했습니다.")
+
+@HiltWorker
+class LocationWorker @AssistedInject constructor(
+    @Assisted private val context: Context,
+    @Assisted workerParams: WorkerParameters,
+    private val locationRepository: LocationRepository,
+    private val fusedLocationClient: FusedLocationProviderClient
+) : CoroutineWorker(context, workerParams) {
+
+    override suspend fun doWork(): Result {
+        return try {
+            // 1. 권한이 있는지 다시 한번 확인 (Worker가 실행되는 시점)
+            val a = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val b = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            
+            if (!a && !b) {
+                // 이 예외는 FAILED 상태를 유발
+                throw LocationPermissionException()
+            }
+
+            // 2. 현재 위치 가져오기 (Priority.PRIORITY_HIGH_ACCURACY)
+            // Task를 await()으로 suspend 함수처럼 사용
+            val location = fusedLocationClient.getCurrentLocation(
+                Priority.PRIORITY_HIGH_ACCURACY,
+                null
+            ).await() // kotlinx-coroutines-play-services 필요
+
+            if (location != null) {
+                // 3. Room DB에 저장
+                locationRepository.saveLocation(
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    timestamp = System.currentTimeMillis()
+                )
+                Result.success()
+            } else {
+                // 위치는 null일 수 있음
+                throw LocationFetchException()
+            }
+
+        } catch (e: Exception) {
+            // throw된 예외는 Result.failure()로 변환됨
+            Result.failure()
+        }
+    }
+
+    companion object {
+        const val WORK_NAME = "LocationWorker"
+    }
+}
+```
+
+### 2-2. DI Module (FusedLocationProviderClient 주입)
+
+`data` 모듈의 `di` 패키지에 `FusedLocationProviderClient`와 `WorkManager`를 제공하는 모듈을 추가합니다.
+
+```kotlin
+// data/src/main/java/com/example/kurlytalent/di/LocationModule.kt
+
+package com.example.kurlytalent.di
+
+import android.content.Context
+import androidx.work.WorkManager
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+import dagger.Module
+import dagger.Provides
+import dagger.hilt.InstallIn
+import dagger.hilt.android.qualifiers.ApplicationContext
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Singleton
+
+@Module
+@InstallIn(SingletonComponent::class)
+object LocationModule {
+
+    @Provides
+    @Singleton
+    fun provideFusedLocationProviderClient(
+        @ApplicationContext context: Context
+    ): FusedLocationProviderClient {
+        return LocationServices.getFusedLocationProviderClient(context)
+    }
+
+    @Provides
+    @Singleton
+    fun provideWorkManager(
+        @ApplicationContext context: Context
+    ): WorkManager {
+        return WorkManager.getInstance(context)
+    }
+}
+```
+
+-----
+
+## 3\. `domain` 모듈 (UseCases)
+
+ViewModel이 `data` 모듈의 `WorkManager`에 직접 의존하지 않도록 UseCase를 정의합니다.
+
+### 3-1. UseCase Interfaces
+
+```kotlin
+// domain/src/main/java/com/example/kurlytalent/domain/usecase/EnqueueLocationUpdateUseCase.kt
+
+package com.example.kurlytalent.domain.usecase
+
+import java.util.UUID
+
+/**
+ * 위치 정보 업데이트 Work를 WorkManager에 등록하는 UseCase
+ */
+interface EnqueueLocationUpdateUseCase : UseCase<Unit, UUID> {
+    override suspend fun invoke(args: Unit): UUID
+}
+
+// domain/src/main/java/com/example/kurlytalent/domain/usecase/ObserveLocationWorkUseCase.kt
+
+package com.example.kurlytalent.domain.usecase
+
+import androidx.work.WorkInfo
+import kotlinx.coroutines.flow.Flow
+import java.util.UUID
+
+/**
+ * 등록된 Work의 상태를 관찰하는 UseCase
+ */
+interface ObserveLocationWorkUseCase : UseCase<UUID, Flow<WorkInfo>> {
+    override suspend fun invoke(args: UUID): Flow<WorkInfo>
+}
+```
+
+### 3-2. UseCase Implementations (`data` 모듈)
+
+`data` 모듈에서 `domain`의 UseCase 인터페이스를 구현합니다.
+
+```kotlin
+// data/src/main/java/com/example/kurlytalent/data/usecase/EnqueueLocationUpdateUseCaseImpl.kt
+
+package com.example.kurlytalent.data.usecase
+
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import com.example.kurlytalent.data.worker.LocationWorker
+import com.example.kurlytalent.domain.usecase.EnqueueLocationUpdateUseCase
+import java.util.UUID
+import javax.inject.Inject
+
+class EnqueueLocationUpdateUseCaseImpl @Inject constructor(
+    private val workManager: WorkManager
+) : EnqueueLocationUpdateUseCase {
+
+    override suspend fun invoke(args: Unit): UUID {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.NOT_REQUIRED) // 네트워크 필요 없음
+            .build()
+
+        val locationWorkRequest = OneTimeWorkRequestBuilder<LocationWorker>()
+            .setConstraints(constraints)
+            .build()
+
+        // 동일한 작업이 이미 실행 중이면 추가하지 않음 (KEEP)
+        workManager.enqueueUniqueWork(
+            LocationWorker.WORK_NAME,
+            ExistingWorkPolicy.KEEP,
+            locationWorkRequest
+        )
+        
+        return locationWorkRequest.id
+    }
+}
+
+// data/src/main/java/com/example/kurlytalent/data/usecase/ObserveLocationWorkUseCaseImpl.kt
+
+package com.example.kurlytalent.data.usecase
+
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.example.kurlytalent.domain.usecase.ObserveLocationWorkUseCase
+import kotlinx.coroutines.flow.Flow
+import java.util.UUID
+import javax.inject.Inject
+
+class ObserveLocationWorkUseCaseImpl @Inject constructor(
+    private val workManager: WorkManager
+) : ObserveLocationWorkUseCase {
+    override suspend fun invoke(args: UUID): Flow<WorkInfo> {
+        return workManager.getWorkInfoByIdFlow(args)
+    }
+}
+```
+
+### 3-3. DI Binds (`data` 모듈)
+
+`RepositoryModule`에 UseCase 바인딩을 추가합니다.
+
+```kotlin
+// data/src/main/java/com/example/kurlytalent/di/RepositoryModule.kt
+
+package com.example.kurlytalent.di
+
+import com.example.kurlytalent.data.repository.LocationRepositoryImpl
+import com.example.kurlytalent.data.usecase.EnqueueLocationUpdateUseCaseImpl
+import com.example.kurlytalent.data.usecase.ObserveLocationWorkUseCaseImpl
+import com.example.kurlytalent.domain.repository.LocationRepository
+import com.example.kurlytalent.domain.usecase.EnqueueLocationUpdateUseCase
+import com.example.kurlytalent.domain.usecase.ObserveLocationWorkUseCase
+import dagger.Binds
+import dagger.Module
+import dagger.hilt.InstallIn
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Singleton
+
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class RepositoryModule {
+
+    @Binds
+    @Singleton
+    abstract fun bindLocationRepository(
+        locationRepositoryImpl: LocationRepositoryImpl
+    ): LocationRepository
+    
+    // --- 여기부터 추가 ---
+    @Binds
+    @Singleton
+    abstract fun bindEnqueueLocationUpdateUseCase(
+        useCase: EnqueueLocationUpdateUseCaseImpl
+    ): EnqueueLocationUpdateUseCase
+
+    @Binds
+    @Singleton
+    abstract fun bindObserveLocationWorkUseCase(
+        useCase: ObserveLocationWorkUseCaseImpl
+    ): ObserveLocationWorkUseCase
+}
+```
