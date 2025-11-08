@@ -24,6 +24,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "KurlyTalent"
 include(":app")
+include(":core")
 include(":data")
 include(":domain")
 include(":feature")

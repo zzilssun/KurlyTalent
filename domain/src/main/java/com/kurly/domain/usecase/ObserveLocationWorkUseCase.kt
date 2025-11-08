@@ -1,6 +1,7 @@
 package com.kurly.domain.usecase
 
 import androidx.work.WorkInfo
+import com.kerly.core.mvi.UseCase
 import kotlinx.coroutines.flow.Flow
 import java.util.UUID
 

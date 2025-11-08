@@ -1,5 +1,6 @@
 package com.kurly.domain.usecase
 
+import com.kerly.core.mvi.UseCase
 import java.util.UUID
 
 interface EnqueueLocationUpdateUseCase : UseCase<Unit, UUID> {
