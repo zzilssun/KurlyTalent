@@ -11,6 +11,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":domain"))
+
     implementation(libs.androidx.core.ktx)
 
     // ViewModel & Lifecycle (Bundle 사용)
