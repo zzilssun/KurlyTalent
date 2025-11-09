@@ -25,6 +25,7 @@ dependencies {
     ksp(libs.hilt.android.compiler)
     implementation(libs.hilt.work)
     ksp(libs.hilt.work.compiler)
+    implementation(libs.androidx.hilt.navigation.compose)
 
     // Jetpack Compose
     implementation(platform(libs.compose.bom))

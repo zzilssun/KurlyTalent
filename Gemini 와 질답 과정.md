@@ -945,3 +945,786 @@ abstract class RepositoryModule {
     ): ObserveLocationWorkUseCase
 }
 ```
+
+---
+# 질문 5
+ViewModel 과 뷰를 구성해보려고해 단 하나의 진실 원칙에 입각해서 단일 State 를 구성을 하고 그동안 생성된 코드를 활용해서 구현을 해보자
+
+# 답변 5
+좋습니다. \*\*단일 진실 원칙(Single Source of Truth)\*\*에 입각하여 `MainState`라는 단일 상태 객체를 두고, `feature` 모듈의 ViewModel과 View(Composable)를 구성해 보겠습니다.
+
+지금까지 우리가 만든 MVI 아키텍처, UseCase, Repository를 모두 활용합니다.
+
+-----
+
+## 1\. MVI 정의 (`MainMVI.kt`)
+
+먼저 `feature` 모듈의 `main` 패키지에 MVI 계약(Contract)을 정의합니다. (이전 단계에서 정의한 내용을 재사용합니다.)
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainMVI.kt
+
+package com.example.kurlytalent.feature.main
+
+import com.example.kurlytalent.domain.model.LocationInfo
+import com.example.kurlytalent.mvi.Action
+import com.example.kurlytalent.mvi.Effect
+import com.example.kurlytalent.mvi.Reducer
+import com.example.kurlytalent.mvi.State
+
+// Actions (UI -> ViewModel)
+sealed interface MainAction : Action {
+    // '현 위치' 버튼 클릭
+    data object OnFetchLocationClicked : MainAction
+    // UI에서 권한 요청 결과 전달
+    data class OnPermissionResult(val isGranted: Boolean) : MainAction
+}
+
+// State (ViewModel -> UI)
+// 단 하나의 진실 원칙(SSOT)
+data class MainState(
+    val isLoading: Boolean = false,
+    val locations: List<LocationInfo> = emptyList() // DB에서 가져온 위치 목록
+) : State
+
+// Effects (ViewModel -> UI, 일회성 이벤트)
+sealed interface MainEffect : Effect {
+    // UI에게 권한을 요청하라고 명령
+    data object RequestLocationPermission : MainEffect
+    // 에러 팝업 표시
+    data class ShowErrorPopup(val message: String) : MainEffect
+}
+
+// Reducer (State 변경 로직)
+sealed interface MainReducer : Reducer<MainState> {
+    data class UpdateLoading(val isLoading: Boolean) : MainReducer {
+        override fun reduce(state: MainState): MainState =
+            state.copy(isLoading = isLoading)
+    }
+
+    data class UpdateLocations(val locations: List<LocationInfo>) : MainReducer {
+        override fun reduce(state: MainState): MainState =
+            state.copy(locations = locations)
+    }
+}
+```
+
+* `MainState`는 UI가 알아야 할 모든 정보를 담고 있습니다. (로딩 상태, 위치 목록)
+
+-----
+
+## 2\. ViewModel (`MainViewModel.kt`)
+
+`BaseViewModel`을 상속받아 MVI 로직을 구현합니다. Hilt를 통해 UseCase와 Repository를 주입받습니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainViewModel.kt
+
+package com.example.kurlytalent.feature.main
+
+import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import com.example.kurlytalent.domain.repository.LocationRepository
+import com.example.kurlytalent.domain.usecase.EnqueueLocationUpdateUseCase
+import com.example.kurlytalent.domain.usecase.ObserveLocationWorkUseCase
+import com.example.kurlytalent.mvi.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CoroutineContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
+import java.util.UUID
+import javax.inject.Inject
+
+@HiltViewModel
+class MainViewModel @Inject constructor(
+    private val enqueueLocationUpdateUseCase: EnqueueLocationUpdateUseCase,
+    private val observeLocationWorkUseCase: ObserveLocationWorkUseCase,
+    private val locationRepository: LocationRepository
+) : BaseViewModel<MainAction, MainState, MainEffect, MainReducer>(
+    initialState = MainState()
+) {
+
+    private var workId: UUID? = null
+    private var observeWorkJob: Job? = null
+
+    init {
+        // ViewModel 생성 시 DB의 모든 위치 정보를 관찰 시작
+        observeAllLocations()
+    }
+
+    /**
+     * UI로부터 Action을 받아 처리합니다.
+     */
+    override fun action(action: MainAction) {
+        when (action) {
+            // '현 위치' 버튼 클릭 시
+            is MainAction.OnFetchLocationClicked -> {
+                launchInViewModelScope {
+                    // UI에 권한 요청 Effect 전달
+                    emitEffect(MainEffect.RequestLocationPermission)
+                }
+            }
+            
+            // UI로부터 권한 요청 결과를 받았을 때
+            is MainAction.OnPermissionResult -> {
+                if (action.isGranted) {
+                    // 권한 있으면 Work 시작
+                    startLocationWork()
+                } else {
+                    // 권한 없으면 에러 팝업
+                    launchInViewModelScope {
+                        emitEffect(MainEffect.ShowErrorPopup("위치 권한이 필요합니다."))
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Room DB의 위치 정보 변경을 실시간으로 관찰합니다.
+     */
+    private fun observeAllLocations() {
+        launchInViewModelScope {
+            locationRepository.getAllLocations().collectLatest { locations ->
+                // DB가 변경될 때마다 State를 업데이트
+                emitReducer(MainReducer.UpdateLocations(locations))
+            }
+        }
+    }
+
+    /**
+     * WorkManager를 통해 위치 정보 업데이트 작업을 시작합니다.
+     */
+    private fun startLocationWork() = launchWithJob {
+        // 1. 로딩 상태 시작
+        emitReducer(MainReducer.UpdateLoading(true))
+        
+        // 2. 이전에 관찰하던 Job이 있다면 취소
+        observeWorkJob?.cancel()
+        
+        // 3. WorkManager에 작업 등록 및 ID 받기
+        workId = enqueueLocationUpdateUseCase(Unit)
+        log("Work enqueued with ID: $workId")
+
+        // 4. Work 상태 관찰 시작
+        observeWorkJob = launchInViewModelScope {
+            workId?.let { id ->
+                observeLocationWorkUseCase(id)
+                    .filter { it.state == WorkInfo.State.RUNNING || it.state.isFinished }
+                    .collectLatest { workInfo ->
+                        when (workInfo.state) {
+                            WorkInfo.State.SUCCEEDED -> {
+                                log("Work SUCCEEDED")
+                                emitReducer(MainReducer.UpdateLoading(false))
+                            }
+                            WorkInfo.State.FAILED -> {
+                                log("Work FAILED")
+                                emitReducer(MainReducer.UpdateLoading(false))
+                                emitEffect(MainEffect.ShowErrorPopup("위치 정보 획득에 실패했습니다."))
+                            }
+                            WorkInfo.State.RUNNING -> {
+                                log("Work RUNNING")
+                                emitReducer(MainReducer.UpdateLoading(true))
+                            }
+                            else -> { /* No-op (BLOCKED, CANCELLED 등) */ }
+                        }
+                    }
+            }
+        }
+    }
+
+    /**
+     * ViewModel 스코프 내에서 발생하는 예외를 처리합니다.
+     */
+    override suspend fun onHandleException(coroutineContext: CoroutineContext, throwable: Throwable) {
+        emitReducer(MainReducer.UpdateLoading(false))
+        emitEffect(MainEffect.ShowErrorPopup(throwable.message ?: "알 수 없는 오류가 발생했습니다."))
+    }
+}
+```
+
+-----
+
+## 3\. View (`MainScreen.kt`)
+
+`Stateful`한 UI를 위해 `state`를 `collectAsState()`로 구독하고, `Action`을 ViewModel로 전달하며, `Effect`를 처리합니다.
+
+**참고:** `accompanist-permissions` 라이브러리가 필요합니다. `feature` 모듈의 `build.gradle.kts`에 추가해주세요.
+
+```kotlin
+// feature/build.gradle.kts
+dependencies {
+    // ...
+    implementation("com.google.accompanist:accompanist-permissions:0.34.0") // (최신 버전 확인)
+}
+```
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainScreen.kt
+
+package com.example.kurlytalent.feature.main
+
+import android.Manifest
+import android.annotation.SuppressLint
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.kurlytalent.domain.model.LocationInfo
+import com.example.kurlytalent.mvi.effect
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.rememberMultiplePermissionsState
+import kotlinx.coroutines.launch
+
+@SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+fun MainScreen(
+    viewModel: MainViewModel = hiltViewModel()
+) {
+    // 1. ViewModel의 State를 구독 (Stateful)
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    // 2. 위치 권한 (FINE + COARSE)
+    val locationPermissionsState = rememberMultiplePermissionsState(
+        permissions = listOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+    )
+
+    // 3. ViewModel의 Effect 처리 (일회성 이벤트)
+    scope.effect(viewModel) { effect: MainEffect ->
+        when (effect) {
+            // 3-1. 권한 요청 Effect 수신 시
+            is MainEffect.RequestLocationPermission -> {
+                scope.launch {
+                    // 권한 팝업 표시
+                    locationPermissionsState.launchPermissionRequest()
+                    // 4. 권한 요청 *결과*를 ViewModel에 Action으로 다시 전달
+                    viewModel.action(
+                        MainAction.OnPermissionResult(locationPermissionsState.allPermissionsGranted)
+                    )
+                }
+            }
+            // 3-2. 에러 팝업 Effect 수신 시
+            is MainEffect.ShowErrorPopup -> {
+                scope.launch {
+                    snackbarHostState.showSnackbar(effect.message)
+                }
+            }
+        }
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            
+            Column(modifier = Modifier.fillMaxSize()) {
+                // 요구사항: 지도뷰에 마커 표시 (지금은 목록으로 대체)
+                Text(text = "저장된 위치 목록", style = MaterialTheme.typography.headlineSmall)
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // 5. State의 locations를 사용해 UI 그리기
+                LocationList(locations = state.locations)
+            }
+
+            // 6. '현 위치' 버튼
+            Button(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth(),
+                onClick = {
+                    // 7. 현재 권한 상태 확인
+                    if (locationPermissionsState.allPermissionsGranted) {
+                        // 7-1. 권한이 이미 있으면, 바로 Action 전달
+                        viewModel.action(MainAction.OnPermissionResult(isGranted = true))
+                    } else {
+                        // 7-2. 권한이 없으면, '버튼 클릭' Action 전달 (Effect가 처리)
+                        viewModel.action(MainAction.OnFetchLocationClicked)
+                    }
+                }
+            ) {
+                Text(text = "현 위치")
+            }
+
+            // 8. State의 isLoading에 따른 로딩 인디케이터
+            if (state.isLoading) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+            }
+        }
+    }
+}
+
+@Composable
+fun LocationList(locations: List<LocationInfo>) {
+    if (locations.isEmpty()) {
+        Text("저장된 위치 정보가 없습니다.")
+    } else {
+        LazyColumn {
+            items(locations) { location ->
+                Text(
+                    text = "ID: ${location.id}, " +
+                           "Lat: ${location.latitude}, " +
+                           "Lon: ${location.longitude}, " +
+                           "Time: ${location.timestamp}"
+                )
+            }
+        }
+    }
+}
+```
+
+### 흐름 요약
+
+1.  `MainScreen`이 Composable되면서 `MainViewModel`의 `init`이 호출되고, `observeAllLocations()`가 실행되어 Room DB를 구독합니다.
+2.  `MainState`의 `locations`가 `LocationList` Composable에 전달됩니다.
+3.  사용자가 "현 위치" 버튼을 클릭합니다.
+4.  `onClick`에서 권한을 확인합니다.
+    * **권한 있음**: `OnPermissionResult(true)` Action이 ViewModel로 갑니다.
+    * **권한 없음**: `OnFetchLocationClicked` Action이 ViewModel로 갑니다.
+5.  **(권한 없음 시)** ViewModel이 `RequestLocationPermission` Effect를 보냅니다.
+6.  `MainScreen`의 `effect` 블록이 Effect를 받아 `launchPermissionRequest()`를 호출합니다.
+7.  권한 팝업이 닫히면, `effect` 블록이 `OnPermissionResult(isGranted)` Action을 ViewModel로 보냅니다.
+8.  ViewModel이 `OnPermissionResult`를 받고, `isGranted`가 `true`이면 `startLocationWork()`를 호출합니다.
+9.  WorkManager가 실행되고, `LocationWorker`가 DB에 위치를 저장합니다.
+10. `observeAllLocations()` (1번에서 실행됨)가 DB 변경을 감지하고 새 목록으로 `MainState`를 업데이트합니다.
+11. `MainScreen`이 자동으로 Recompose되어 `LocationList`에 새 위치가 표시됩니다.
+
+이제 지도뷰를 제외한 핵심 로직(권한, WorkManager, Room, MVI)이 완성되었습니다.
+
+---
+
+# 질문 6
+rememberMultiplePermissionsState 대신 rememberLauncherForActivityResult 사용해 저 라이브러리는 이제 사용되지 않아
+
+# 답변 6
+정확한 지적입니다\! 👏 `accompanist-permissions`는 공식적으로 `androidx.activity`의 `rememberLauncherForActivityResult`로 대체되었습니다.
+
+새로운 API를 사용하고, ViewModel과 UI의 역할을 더 명확하게 분리하는 방향으로 코드를 리팩토링해 보겠습니다.
+
+변경된 핵심 로직은 다음과 같습니다.
+
+1.  **ViewModel**: `@ApplicationContext`를 주입받아, '현 위치' 버튼 클릭 시 **ViewModel이 직접 권한을 확인**합니다.
+    * 권한이 **있으면**: `OnPermissionResult(true)` Action을 스스로 호출하여 바로 Work를 시작합니다.
+    * 권한이 **없으면**: `RequestLocationPermission` Effect를 UI로 보내 권한 팝업을 띄우도록 요청합니다.
+2.  **View (Screen)**: `rememberLauncherForActivityResult`를 사용합니다.
+    * `onClick`에서는 `OnFetchLocationClicked` Action만 보냅니다. (UI는 권한 상태를 모름)
+    * `RequestLocationPermission` Effect를 받으면 런처를 실행(`launch`)합니다.
+    * 런처의 `onResult` 콜백에서 `OnPermissionResult(isGranted)` Action을 ViewModel로 전달합니다.
+
+-----
+
+## 1\. `MainViewModel.kt` (수정)
+
+`@ApplicationContext`를 주입받고 `action` 핸들러 내부 로직을 수정합니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainViewModel.kt
+
+package com.example.kurlytalent.feature.main
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import com.example.kurlytalent.domain.repository.LocationRepository
+import com.example.kurlytalent.domain.usecase.EnqueueLocationUpdateUseCase
+import com.example.kurlytalent.domain.usecase.ObserveLocationWorkUseCase
+import com.example.kurlytalent.mvi.BaseViewModel
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext // Hilt 어노테이션 임포트
+import kotlinx.coroutines.CoroutineContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
+import java.util.UUID
+import javax.inject.Inject
+
+@HiltViewModel
+class MainViewModel @Inject constructor(
+    @ApplicationContext private val context: Context, // 1. ApplicationContext 주입
+    private val enqueueLocationUpdateUseCase: EnqueueLocationUpdateUseCase,
+    private val observeLocationWorkUseCase: ObserveLocationWorkUseCase,
+    private val locationRepository: LocationRepository
+) : BaseViewModel<MainAction, MainState, MainEffect, MainReducer>(
+    initialState = MainState()
+) {
+
+    private var workId: UUID? = null
+    private var observeWorkJob: Job? = null
+
+    init {
+        observeAllLocations()
+    }
+
+    /**
+     * UI로부터 Action을 받아 처리합니다.
+     */
+    override fun action(action: MainAction) {
+        when (action) {
+            // '현 위치' 버튼 클릭 시
+            is MainAction.OnFetchLocationClicked -> {
+                // 2. ViewModel이 직접 권한 상태 확인
+                checkLocationPermission()
+            }
+            
+            // UI(런처) 또는 ViewModel(checkLocationPermission)로부터 권한 결과를 받았을 때
+            is MainAction.OnPermissionResult -> {
+                if (action.isGranted) {
+                    startLocationWork()
+                } else {
+                    launchInViewModelScope {
+                        emitEffect(MainEffect.ShowErrorPopup("위치 권한이 필요합니다."))
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * 위치 권한을 확인하고, 결과에 따라 로직을 분기합니다.
+     */
+    private fun checkLocationPermission() = launchInViewModelScope {
+        val finePermissionGranted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val coarsePermissionGranted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (finePermissionGranted || coarsePermissionGranted) {
+            // 3. 권한이 이미 있으면, '결과' 액션을 스스로 호출
+            action(MainAction.OnPermissionResult(isGranted = true))
+        } else {
+            // 4. 권한이 없으면, UI에 권한 요청 Effect 전달
+            emitEffect(MainEffect.RequestLocationPermission)
+        }
+    }
+
+    /**
+     * Room DB의 위치 정보 변경을 실시간으로 관찰합니다.
+     */
+    private fun observeAllLocations() {
+        launchInViewModelScope {
+            locationRepository.getAllLocations().collectLatest { locations ->
+                emitReducer(MainReducer.UpdateLocations(locations))
+            }
+        }
+    }
+
+    /**
+     * WorkManager를 통해 위치 정보 업데이트 작업을 시작합니다.
+     */
+    private fun startLocationWork() = launchWithJob {
+        emitReducer(MainReducer.UpdateLoading(true))
+        observeWorkJob?.cancel()
+        
+        workId = enqueueLocationUpdateUseCase(Unit)
+        log("Work enqueued with ID: $workId")
+
+        observeWorkJob = launchInViewModelScope {
+            workId?.let { id ->
+                observeLocationWorkUseCase(id)
+                    .filter { it.state == WorkInfo.State.RUNNING || it.state.isFinished }
+                    .collectLatest { workInfo ->
+                        when (workInfo.state) {
+                            WorkInfo.State.SUCCEEDED -> {
+                                log("Work SUCCEEDED")
+                                emitReducer(MainReducer.UpdateLoading(false))
+                            }
+                            WorkInfo.State.FAILED -> {
+                                log("Work FAILED")
+                                emitReducer(MainReducer.UpdateLoading(false))
+                                emitEffect(MainEffect.ShowErrorPopup("위치 정보 획득에 실패했습니다."))
+                            }
+                            WorkInfo.State.RUNNING -> {
+                                log("Work RUNNING")
+                                emitReducer(MainReducer.UpdateLoading(true))
+                            }
+                            else -> { /* No-op */ }
+                        }
+                    }
+            }
+        }
+    }
+
+    override suspend fun onHandleException(coroutineContext: CoroutineContext, throwable: Throwable) {
+        emitReducer(MainReducer.UpdateLoading(false))
+        emitEffect(MainEffect.ShowErrorPopup(throwable.message ?: "알 수 없는 오류가 발생했습니다."))
+    }
+}
+```
+
+-----
+
+## 2\. `MainScreen.kt` (수정)
+
+`rememberMultiplePermissionsState`를 제거하고 `rememberLauncherForActivityResult`로 대체합니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainScreen.kt
+
+package com.example.kurlytalent.feature.main
+
+import android.Manifest
+import android.annotation.SuppressLint
+import androidx.activity.compose.rememberLauncherForActivityResult // 1. 임포트 변경
+import androidx.activity.result.contract.ActivityResultContracts // 1. 임포트 변경
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.kurlytalent.domain.model.LocationInfo
+import com.example.kurlytalent.mvi.effect
+// com.google.accompanist.permissions 관련 임포트 모두 제거
+import kotlinx.coroutines.launch
+
+@SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
+@Composable
+fun MainScreen(
+    viewModel: MainViewModel = hiltViewModel()
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    // 2. 권한 요청에 필요한 권한 목록
+    val permissionsToRequest = arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+
+    // 3. rememberLauncherForActivityResult 정의
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = { permissionsMap ->
+            // 4. 권한 요청 *결과*를 ViewModel에 Action으로 전달
+            val isGranted = permissionsMap.values.all { it }
+            viewModel.action(MainAction.OnPermissionResult(isGranted))
+        }
+    )
+
+    // 5. ViewModel의 Effect 처리 (일회성 이벤트)
+    scope.effect(viewModel) { effect: MainEffect ->
+        when (effect) {
+            // 5-1. 권한 요청 Effect 수신 시
+            is MainEffect.RequestLocationPermission -> {
+                // 런처 실행
+                locationPermissionLauncher.launch(permissionsToRequest)
+            }
+            // 5-2. 에러 팝업 Effect 수신 시
+            is MainEffect.ShowErrorPopup -> {
+                scope.launch {
+                    snackbarHostState.showSnackbar(effect.message)
+                }
+            }
+        }
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            
+            Column(modifier = Modifier.fillMaxSize()) {
+                Text(text = "저장된 위치 목록", style = MaterialTheme.typography.headlineSmall)
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // 6. State의 locations를 사용해 UI 그리기
+                LocationList(locations = state.locations)
+            }
+
+            // 7. '현 위치' 버튼
+            Button(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth(),
+                onClick = {
+                    // 8. 버튼 클릭 시 항상 OnFetchLocationClicked Action 전송
+                    // 권한 확인은 ViewModel이 담당
+                    viewModel.action(MainAction.OnFetchLocationClicked)
+                }
+            ) {
+                Text(text = "현 위치")
+            }
+
+            // 9. State의 isLoading에 따른 로딩 인디케이터
+            if (state.isLoading) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+            }
+        }
+    }
+}
+
+@Composable
+fun LocationList(locations: List<LocationInfo>) {
+    if (locations.isEmpty()) {
+        Text("저장된 위치 정보가 없습니다.")
+    } else {
+        LazyColumn {
+            items(locations) { location ->
+                Text(
+                    text = "ID: ${location.id}, " +
+                           "Lat: ${location.latitude}, " +
+                           "Lon: ${location.longitude}, " +
+                           "Time: ${location.timestamp}"
+                )
+            }
+        }
+    }
+}
+```
+
+이 구조가 훨씬 더 깔끔하고 안드로이드에서 권장하는 최신 패턴을 따릅니다. UI는 이제 권한 상태를 알 필요 없이 ViewModel의 '명령'(`Effect`)에만 반응하면 됩니다.
+
+---
+
+# 질문 7
+Manifest 설정도 알려줘
+
+# 답변 7
+좋습니다\! 지금까지 논의한 기능(위치, WorkManager, Hilt, 지도)을 정상적으로 동작시키기 위해 `AndroidManifest.xml`에 필요한 설정들을 알려드리겠습니다.
+
+`feature` 모듈 (또는 `app` 모듈)의 `src/main/AndroidManifest.xml` 파일에 아래 내용을 추가하거나 확인해야 합니다.
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+
+    <application
+        android:name=".KurlyApplication" android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.KurlyTalent"
+        tools:targetApi="31">
+        
+        <activity
+            android:name=".MainActivity" android:exported="true"
+            android:theme="@style/Theme.KurlyTalent">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="YOUR_GOOGLE_MAPS_API_KEY_HERE" />
+            
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
+    </application>
+
+</manifest>
+```
+
+### 주요 설정 설명
+
+1.  **위치 권한 (`ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION`)**
+
+    * `FusedLocationProviderClient`가 `PRIORITY_HIGH_ACCURACY`로 현재 위치를 가져오기 위해 필수입니다.
+
+2.  **포그라운드 서비스 권한 (`FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_LOCATION`)**
+
+    * `WorkManager`가 신속한 작업(expedited job)으로 위치 조회를 실행할 때 내부적으로 포그라운드 서비스를 사용할 수 있습니다. 이 경우 해당 권한이 필요합니다.
+
+3.  **Hilt Application (`android:name`)**
+
+    * `<application>` 태그의 `android:name` 속성에 Hilt 설정을 마친 `KurlyApplication` 클래스를 지정해야 합니다.
+
+4.  **WorkManager 초기화 (`<provider>`)**
+
+    * `HiltWorkerFactory`를 `Application` 클래스에서 `Configuration.Provider`를 통해 주입하고 있습니다. 이 방식은 `WorkManager`의 기본 초기화(`androidx.startup`)와 충돌할 수 있습니다.
+    * 따라서 `tools:node="remove"` 속성을 사용해 기본 `WorkManagerInitializer`를 Manifest에서 제거하고, 우리가 정의한 `Configuration.Provider`가 유일한 설정이 되도록 보장하는 것이 안전합니다.
+
+5.  **지도 API 키 (`<meta-data>`)**
+
+    * 요구사항에 따라 Google, Naver, Kakao 등 원하는 지도 플랫폼을 사용할 수 있습니다.
+    * 선택한 플랫폼에 맞는 API 키를 `<meta-data>`로 등록해야 지도가 정상적으로 로드됩니다.
+
+이제 지도뷰 구현만 남았습니다\! 지도 관련 코드를 작성해 볼까요?
