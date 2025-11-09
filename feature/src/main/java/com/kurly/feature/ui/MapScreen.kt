@@ -50,7 +50,12 @@ internal fun MapScreen(
         onResult = { permissionsMap ->
             val isGranted = permissionsMap.values.all { it }
             if (isGranted) {
-                viewModel.action(MapAction.OnPermissionResult(isGranted = true, shouldShowRationale = false))
+                viewModel.action(
+                    MapAction.OnPermissionResult(
+                        isGranted = true,
+                        shouldShowRationale = false
+                    )
+                )
             } else {
                 val activity = context.findActivity()
                 val shouldShowRationale = if (activity != null) {
@@ -61,7 +66,12 @@ internal fun MapScreen(
                     true
                 }
 
-                viewModel.action(MapAction.OnPermissionResult(isGranted = false, shouldShowRationale = shouldShowRationale))
+                viewModel.action(
+                    MapAction.OnPermissionResult(
+                        isGranted = false,
+                        shouldShowRationale = shouldShowRationale
+                    )
+                )
             }
         }
     )

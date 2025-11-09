@@ -78,7 +78,7 @@ internal class MapViewModel @Inject constructor(
         ) == PackageManager.PERMISSION_GRANTED
 
         if (finePermissionGranted || coarsePermissionGranted) {
-            startLocationWork()
+            action(MapAction.OnPermissionResult(isGranted = true, shouldShowRationale = false))
         } else {
             emitEffect(MapEffect.RequestLocationPermission)
         }
@@ -114,8 +114,9 @@ internal class MapViewModel @Inject constructor(
                             }
 
                             WorkInfo.State.FAILED -> {
+                                val errorMsg = workInfo.outputData.getString("ERROR_MSG") ?: "위치 정보 획득에 실패했습니다."
                                 emitReducer(MapReducer.UpdateLoading(false))
-                                emitEffect(MapEffect.ShowErrorPopup("위치 정보 획득에 실패했습니다."))
+                                emitEffect(MapEffect.ShowErrorPopup(errorMsg))
                             }
 
                             WorkInfo.State.RUNNING -> {

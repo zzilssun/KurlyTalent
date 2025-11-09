@@ -7,6 +7,7 @@ import androidx.core.content.ContextCompat
 import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.Priority
 import com.kerly.data.worker.exception.LocationException
@@ -48,8 +49,9 @@ class LocationWorker @AssistedInject constructor(
                 throw LocationException.FailToFetch()
             }
 
-        } catch (_: Exception) {
-            Result.failure()
+        } catch (e: Exception) {
+            val errorMessage = (e as? LocationException)?.message ?: "알 수 없는 오류"
+            Result.failure(workDataOf("ERROR_MSG" to errorMessage))
         }
     }
 

@@ -2506,3 +2506,235 @@ private fun Context.findActivity(): Activity? {
 
 // (toFormattedString 확장 함수는 동일)
 ```
+
+---
+
+# 질문 11
+요구사항
+- '현 위치' 버튼을 클릭하면 현재 위치를 WorkManager로 조회합니다. 
+- 조회된 위치 정보는 Room 로컬 DB에 저장합니다. 
+- Room 로컬 DB에 저장된 정보를 가지고 와서 지도뷰에 마커 표시를 합니다.
+
+요구 사항은 다음과 같았고, 안드로이드 앱 아키텍처에 의거해서 MVI 패턴으로 구현을 한거야
+전체적으로 코드를 검토하고 개선사항이 있다면 의견을 말해봐
+
+# 답변 11
+전체적으로 코드를 검토해 본 결과, 훌륭하게 작성된 프로젝트입니다. 👏
+
+요구사항이었던 **WorkManager를 통한 위치 조회**, **Room DB 저장**, **지도 마커 표시**가 모두 MVI 아키텍처와 클린 아키텍처의 모듈 구조(app, core, data, domain, feature)에 맞게 잘 구현되었습니다.
+
+특히 다음과 같은 점들이 인상적입니다.
+
+* **최신 아키텍처 적용:** MVI 패턴(BaseViewModel, Action, State, Effect, Reducer)을 `core` 모듈로 분리하여 명확한 단방향 데이터 흐름(UDF)을 구축했습니다.
+* **모듈화 (Multi-Module):** `build-logic`과 `libs.versions.toml`을 사용한 컨벤션 플러그인 기반의 모듈화는 매우 깔끔하며 확장성이 뛰어난 현대적인 방식입니다.
+* **DI (Hilt):** Hilt를 `@HiltWorker`, `@HiltViewModel` 등 각 계층에 맞게 적절히 사용하여 의존성 관리가 잘 되고 있습니다.
+* **비동기 처리:** `Flow`를 사용한 Room DB 관찰, `viewModelScope` 및 `suspend` 함수, `Tasks.await()` 등 Coroutine을 이용한 비동기 처리가 올바르게 적용되었습니다.
+* **UI/UX 디테일:**
+    * `rememberLauncherForActivityResult`를 사용한 최신 권한 처리.
+    * `shouldShowRequestPermissionRationale`을 확인하여 '영구 거부' 시 설정 화면으로 유도하는(`GoToAppSettings`) 로직.
+    * `onMapLoaded`를 활용하여 지도 초기화와 `LaunchedEffect` 간의 레이스 컨디션(CameraUpdateFactory NPE)을 해결한 점.
+
+-----
+
+## 개선 제안 사항
+
+이미 훌륭하지만, 몇 가지 더 견고하고 안전하게 만들 수 있는 부분들을 제안합니다.
+
+### 1\. (가장 중요) API 키 하드코딩 문제
+
+`app/src/main/AndroidManifest.xml` 파일에 Google Maps API 키가 하드코딩되어 있습니다.
+
+```xml
+<meta-data
+    android:name="com.google.android.geo.API_KEY"
+    android:value="AIzaSyC0UZsSoGrppJAZtCYVKMcZA-o1T5w6yP0" />
+```
+
+이는 **심각한 보안 문제**로, 이 키가 GitHub 등 공개된 장소에 노출되면 악의적인 사용자가 키를 도용하여 막대한 과금이 발생할 수 있습니다.
+
+**해결책:**
+이미 `build-logic`에 `secrets-gradle-plugin` 설정이 되어 있고, `build.gradle.kts`에서도 플러그인을 적용하고 있습니다. 대화 과정에서 논의했듯이 이 플러그인을 활성화해서 사용해야 합니다.
+
+1.  **`local.properties` 파일 (프로젝트 루트)**: (Git에 올라가지 않도록 `.gitignore`에 포함되어 있어야 합니다)
+
+    ```properties
+    MAPS_API_KEY=AIzaSyC0UZsSoGrppJAZtCYVKMcZA-o1T5w6yP0
+    ```
+
+2.  **`app/src/main/AndroidManifest.xml`**:
+    하드코딩된 `value`를 플러그인이 주입할 플레이스홀더로 변경합니다.
+
+    ```xml
+    <meta-data
+        android:name="com.google.android.geo.API_KEY"
+        android:value="${MAPS_API_KEY}" />
+    ```
+
+-----
+
+### 2\. WorkManager의 구체적인 실패 사유 전달
+
+현재 `LocationWorker`는 `try-catch`로 모든 예외를 잡아 `Result.failure()`를 반환합니다.
+
+```kotlin
+// data/src/main/java/com/kerly/data/worker/LocationWorker.kt
+override suspend fun doWork(): Result {
+    return try {
+        // ...
+        if (!a && !b) {
+            throw LocationException.PermissionDenied()
+        }
+        // ...
+        if (location != null) {
+            // ...
+            Result.success()
+        } else {
+            throw LocationException.FailToFetch()
+        }
+    } catch (_: Exception) {
+        Result.failure() // 1. 모든 예외가 이쪽으로 빠짐
+    }
+}
+```
+
+`MapViewModel`은 `WorkInfo.State.FAILED` 상태만 받고, "위치 정보 획득에 실패했습니다."라는 일반적인 오류 메시지를 표시합니다.
+
+```kotlin
+// feature/src/main/java/com/kurly/feature/viewModel/MapViewModel.kt
+WorkInfo.State.FAILED -> {
+    emitReducer(MapReducer.UpdateLoading(false))
+    // 2. 항상 동일한 메시지
+    emitEffect(MapEffect.ShowErrorPopup("위치 정보 획득에 실패했습니다."))
+}
+```
+
+`LocationException.kt`에 정의한 "권한이 없습니다." 또는 "가져오기 실패" 같은 구체적인 원인을 사용자에게 알려주는 것이 UX에 더 좋습니다.
+
+**해결책:**
+`WorkManager`의 `Result.failure()`에 `Data`를 실어 실패 원인을 전달합니다.
+
+1.  **`LocationWorker.kt` 수정:**
+    ```kotlin
+    // data/src/main/java/com/kerly/data/worker/LocationWorker.kt
+    // ...
+    import androidx.work.workDataOf // 임포트 추가
+
+    // ...
+    } catch (e: Exception) {
+        val errorMessage = (e as? LocationException)?.message ?: "알 수 없는 오류"
+        // 실패 시 오류 메시지를 outputData에 담아 반환
+        Result.failure(workDataOf("ERROR_MSG" to errorMessage))
+    }
+    ```
+
+}
+\`\`\`
+
+2.  **`MapViewModel.kt` 수정:**
+    ```kotlin
+    // feature/src/main/java/com/kurly/feature/viewModel/MapViewModel.kt
+    WorkInfo.State.FAILED -> {
+        // outputData에서 오류 메시지 추출
+        val errorMsg = workInfo.outputData.getString("ERROR_MSG")
+            ?: "위치 정보 획득에 실패했습니다." // 기본 메시지
+        emitReducer(MapReducer.UpdateLoading(false))
+        emitEffect(MapEffect.ShowErrorPopup(errorMsg))
+    }
+    ```
+
+-----
+
+### 3\. ViewModel 권한 확인 로직 리팩토링 (Minor)
+
+`MapViewModel.kt`의 `checkLocationPermission()` 함수는 권한이 있을 경우 `startLocationWork()`를 **직접** 호출합니다.
+
+```kotlin
+// feature/src/main/java/com/kurly/feature/viewModel/MapViewModel.kt
+private fun checkLocationPermission() = launchInViewModelScope {
+    // ...
+    if (finePermissionGranted || coarsePermissionGranted) {
+        startLocationWork() // 1. 여기서 직접 호출
+    } else {
+        emitEffect(MapEffect.RequestLocationPermission)
+    }
+}
+
+override fun action(action: MapAction) {
+    when (action) {
+        is MapAction.OnFetchLocationClicked -> {
+            checkLocationPermission()
+        }
+        is MapAction.OnPermissionResult -> {
+            if (action.isGranted) {
+                startLocationWork() // 2. 여기서도 호출
+            } // ...
+        }
+    }
+}
+```
+
+`startLocationWork()` 호출 로직이 두 군데로 분산되어 있습니다. `OnPermissionResult` 핸들러로 로직을 통합하면 MVI 흐름이 더 명확해집니다.
+
+**해결책:**
+`checkLocationPermission()`이 `startLocationWork()`를 직접 호출하는 대신, `OnPermissionResult(true)` Action을 자신에게 보내도록 변경합니다.
+
+```kotlin
+// feature/src/main/java/com/kurly/feature/viewModel/MapViewModel.kt
+private fun checkLocationPermission() = launchInViewModelScope {
+    // ...
+    if (finePermissionGranted || coarsePermissionGranted) {
+        // 1. startLocationWork() 대신 Action을 호출
+        action(MapAction.OnPermissionResult(isGranted = true, shouldShowRationale = false))
+    } else {
+        emitEffect(MapEffect.RequestLocationPermission)
+    }
+}
+
+override fun action(action: MapAction) {
+    when (action) {
+        is MapAction.OnFetchLocationClicked -> {
+            checkLocationPermission()
+        }
+        is MapAction.OnPermissionResult -> {
+            if (action.isGranted) {
+                // 2. startLocationWork() 호출 로직이 여기로 통합됨
+                startLocationWork()
+            } else {
+                if (action.shouldShowRationale) {
+                    launchInViewModelScope {
+                        emitEffect(MapEffect.ShowErrorPopup("위치 권한이 필요합니다."))
+                    }
+                } else {
+                    launchInViewModelScope {
+                        emitEffect(MapEffect.GoToAppSettings)
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+-----
+
+### 4\. 위치 요청 정확도 (Discussion)
+
+`LocationWorker.kt`에서 `Priority.PRIORITY_HIGH_ACCURACY`를 사용하고 있습니다.
+
+```kotlin
+// data/src/main/java/com/kerly/data/worker/LocationWorker.kt
+val location = fusedLocationClient.getCurrentLocation(
+    Priority.PRIORITY_HIGH_ACCURACY,
+    null
+).await()
+```
+
+'현 위치' 버튼 클릭 시 가장 정확한 위치를 가져오는 것은 요구사항에 부합합니다. 다만, 이 옵션은 GPS를 활성화하여 배터리 소모가 크다는 점을 인지하고 있어야 합니다. 만약 이 기능이 주기적인 백그라운드 작업이었다면 `PRIORITY_BALANCED_POWER_ACCURACY`가 훨씬 적합했을 것입니다.
+
+현재의 '버튼 클릭' 기반 일회성 요청에는 `PRIORITY_HIGH_ACCURACY`도 합리적인 선택입니다.
+
+## 총평
+
+제시된 요구사항을 완벽하게 충족하며, 안드로이드 개발의 모범 사례(Clean Architecture, Multi-Module, MVI, Hilt, Coroutine)를 매우 높은 수준으로 적용한 훌륭한 프로젝트입니다.
+
+위에 제안한 API 키 보안 문제만 즉시 해결한다면, 매우 견고하고 잘 만들어진 앱입니다. 고생하셨습니다\!
