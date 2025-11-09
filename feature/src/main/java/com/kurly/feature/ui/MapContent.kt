@@ -1,17 +1,16 @@
 package com.kurly.feature.ui
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -22,45 +21,75 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.kurly.domain.model.LocationInfo
+import com.google.android.gms.maps.model.LatLng
+import com.google.maps.android.compose.CameraPositionState
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.Marker
+import com.google.maps.android.compose.MarkerState
 import com.kurly.feature.mvi.MapUiState
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun MapContent(
     state: MapUiState,
     snackbarHostState: SnackbarHostState,
+    cameraPositionState: CameraPositionState,
     modifier: Modifier = Modifier,
+    onMapLoaded: () -> Unit,
     onFetchLocationClick: () -> Unit,
 ) {
     Scaffold(
         modifier = modifier,
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = {
+                    Text(
+                        text = "KurlyTalent",
+                    )
+                },
+            )
+        },
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp)
+                .padding(16.dp),
         ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                // 요구사항: 지도뷰에 마커 표시 (지금은 목록으로 대체)
-                Text(text = "저장된 위치 목록", style = MaterialTheme.typography.headlineSmall)
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // 5. State의 locations를 사용해 UI 그리기
-                LocationList(locations = state.locations)
-            }
-
-            // 6. '현 위치' 버튼
-            Button(
+            Column(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth(),
-                onClick = onFetchLocationClick,
+                    .fillMaxHeight(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text(text = "현 위치")
+                GoogleMap(
+                    modifier = Modifier
+                        .weight(1f),
+                    cameraPositionState = cameraPositionState,
+                    onMapLoaded = onMapLoaded,
+                ) {
+                    state.locations.forEach { location ->
+                        Marker(
+                            state = MarkerState(
+                                position = LatLng(location.latitude, location.longitude)
+                            ),
+                            title = "위치 ID: ${location.id}",
+                            snippet = "시간: ${location.timestamp.toFormattedString()}"
+                        )
+                    }
+                }
+
+                Button(
+                    modifier = Modifier
+                        .fillMaxWidth(),
+                    onClick = onFetchLocationClick,
+                ) {
+                    Text(text = "현 위치")
+                }
             }
 
-            // 8. State의 isLoading에 따른 로딩 인디케이터
             if (state.isLoading) {
                 CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
             }
@@ -68,22 +97,9 @@ internal fun MapContent(
     }
 }
 
-@Composable
-private fun LocationList(locations: List<LocationInfo>) {
-    if (locations.isEmpty()) {
-        Text("저장된 위치 정보가 없습니다.")
-    } else {
-        LazyColumn {
-            items(locations) { location ->
-                Text(
-                    text = "ID: ${location.id}, " +
-                            "Lat: ${location.latitude}, " +
-                            "Lon: ${location.longitude}, " +
-                            "Time: ${location.timestamp}"
-                )
-            }
-        }
-    }
+private fun Long.toFormattedString(): String {
+    val sdf = SimpleDateFormat("yyyy.MM.dd HH:mm:ss", Locale.getDefault())
+    return sdf.format(Date(this))
 }
 
 @Preview
@@ -93,7 +109,10 @@ private fun PreviewMapContent() {
         MapContent(
             state = MapUiState(),
             snackbarHostState = SnackbarHostState(),
-            onFetchLocationClick = {}
+            cameraPositionState = CameraPositionState(),
+            modifier = Modifier.fillMaxSize(),
+            onMapLoaded = {},
+            onFetchLocationClick = {},
         )
     }
 }

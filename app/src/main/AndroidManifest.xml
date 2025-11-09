@@ -34,6 +34,11 @@
             </intent-filter>
         </activity>
 
+        <!-- 원래대로라면 local.properties 에 기록을 해야 하나 임의로 처리 -->
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="AIzaSyC0UZsSoGrppJAZtCYVKMcZA-o1T5w6yP0" />
+
         <provider
             android:name="androidx.startup.InitializationProvider"
             android:authorities="${applicationId}.androidx-startup"

@@ -1728,3 +1728,781 @@ Manifest 설정도 알려줘
     * 선택한 플랫폼에 맞는 API 키를 `<meta-data>`로 등록해야 지도가 정상적으로 로드됩니다.
 
 이제 지도뷰 구현만 남았습니다\! 지도 관련 코드를 작성해 볼까요?
+
+---
+
+# 질문 8
+지도 관련된 코드도 구현을 해보자
+secrets-gradle-plugin 를 통해서 키를 숨겨서 사용하려고 하는데 이걸 사용하는 방법을 함께 서술해줘
+
+# 답변 8
+알겠습니다. 요구사항의 마지막 단계인 "Room 로컬 DB에 저장된 정보를 가지고 와서 지도뷰에 마커 표시"를 구현해 보겠습니다.
+
+말씀하신 대로 \*\*`secrets-gradle-plugin`\*\*을 사용하여 Google Maps API 키를 안전하게 관리하는 방법부터 지도 구현까지 함께 진행합니다.
+
+-----
+
+## 1\. 🗺️ `secrets-gradle-plugin` 설정하기
+
+이 플러그인은 `local.properties` 파일에 저장된 키를 빌드 시 `AndroidManifest.xml`이나 `BuildConfig`에 안전하게 주입해 줍니다. `local.properties`는 `.gitignore`에 포함되어 있어 Git에 노출되지 않습니다. (이미 `local.properties`가 `.gitignore`에 포함된 것을 확인했습니다.)
+
+### 1-1. 프로젝트 루트 `build.gradle.kts`
+
+`plugins` 블록에 플러그인 ID를 추가합니다.
+
+```kotlin
+// build.gradle.kts (Project)
+
+plugins {
+    // ...
+    id("com.google.android.libraries.mapsplatform.secrets-gradle-plugin") version "2.0.1" apply false
+}
+```
+
+### 1-2. `feature` 모듈 `build.gradle.kts`
+
+`feature` 모듈(또는 지도를 사용하는 모듈)의 `plugins` 블록에 플러그인을 적용합니다.
+
+```kotlin
+// feature/build.gradle.kts
+
+plugins {
+    // ...
+    id("com.google.android.libraries.mapsplatform.secrets-gradle-plugin")
+}
+```
+
+### 1-3. `local.properties` 파일
+
+프로젝트 루트의 `local.properties` 파일에 API 키를 추가합니다. (이 파일은 Git에 올라가지 않습니다.)
+
+```properties
+# local.properties
+
+MAPS_API_KEY=YOUR_GOOGLE_MAPS_API_KEY_HERE
+```
+
+### 1-4. `AndroidManifest.xml` (feature 모듈)
+
+`application` 태그 내에 API 키를 참조하는 `<meta-data>`를 추가합니다. 플러그인이 빌드 시 `"${MAPS_API_KEY}"` 부분을 실제 키로 교체합니다.
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    ...>
+    <application ...>
+        
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="${MAPS_API_KEY}" />
+            
+    </application>
+</manifest>
+```
+
+-----
+
+## 2\. 지도 라이브러리 추가
+
+Jetpack Compose에서 Google 지도를 사용하기 위한 라이브러리를 `feature` 모듈에 추가합니다.
+
+```kotlin
+// feature/build.gradle.kts
+
+dependencies {
+    // ... (기존 Hilt, ViewModel, Compose 등)
+    
+    // Google Maps for Compose
+    implementation("com.google.maps.android:maps-compose:4.3.3") // (버전은 최신화 확인)
+    implementation("com.google.android.gms:play-services-maps:18.2.0")
+}
+```
+
+-----
+
+## 3\. `MainScreen.kt`에 지도 구현
+
+`MainState`의 `locations` 리스트를 `GoogleMap` Composable에 바인딩하여 마커를 표시합니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainScreen.kt
+
+package com.example.kurlytalent.feature.main
+
+import android.Manifest
+import android.annotation.SuppressLint
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+//import androidx.compose.foundation.layout.Column // (제거)
+//import androidx.compose.foundation.layout.Spacer // (제거)
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+//import androidx.compose.foundation.layout.height // (제거)
+import androidx.compose.foundation.layout.padding
+//import androidx.compose.foundation.lazy.LazyColumn // (제거)
+//import androidx.compose.foundation.lazy.items // (제거)
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+//import androidx.compose.material3.MaterialTheme // (제거)
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.kurlytalent.domain.model.LocationInfo
+import com.example.kurlytalent.mvi.effect
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import com.google.maps.android.compose.GoogleMap // 1. Map 임포트
+import com.google.maps.android.compose.Marker // 2. Marker 임포트
+import com.google.maps.android.compose.MarkerState // 3. MarkerState 임포트
+import com.google.maps.android.compose.rememberCameraPositionState // 4. CameraState 임포트
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+@SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
+@Composable
+fun MainScreen(
+    viewModel: MainViewModel = hiltViewModel()
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    val permissionsToRequest = arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = { permissionsMap ->
+            val isGranted = permissionsMap.values.all { it }
+            viewModel.action(MainAction.OnPermissionResult(isGranted))
+        }
+    )
+
+    scope.effect(viewModel) { effect: MainEffect ->
+        when (effect) {
+            is MainEffect.RequestLocationPermission -> {
+                locationPermissionLauncher.launch(permissionsToRequest)
+            }
+            is MainEffect.ShowErrorPopup -> {
+                scope.launch {
+                    snackbarHostState.showSnackbar(effect.message)
+                }
+            }
+        }
+    }
+
+    // --- 5. 지도 카메라 상태 추가 ---
+    val cameraPositionState = rememberCameraPositionState {
+        // 기본 위치 (서울)
+        position = CameraPosition.fromLatLngZoom(LatLng(37.5665, 126.9780), 10f)
+    }
+
+    // --- 6. DB 위치 목록(State)이 변경되면 카메라 이동 ---
+    LaunchedEffect(state.locations) {
+        state.locations.firstOrNull()?.let { latestLocation ->
+            // 가장 최신 위치로 카메라를 부드럽게 이동
+            cameraPositionState.animate(
+                com.google.android.gms.maps.model.CameraUpdateFactory.newLatLngZoom(
+                    LatLng(latestLocation.latitude, latestLocation.longitude), 15f
+                )
+            )
+        }
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // .padding(16.dp) // 지도는 전체 화면을 사용하도록 패딩 제거
+        ) {
+
+            // --- 7. 지도 뷰 구현 ---
+            GoogleMap(
+                modifier = Modifier.fillMaxSize(),
+                cameraPositionState = cameraPositionState
+            ) {
+                // 8. State의 locations 리스트를 순회하며 마커 생성
+                state.locations.forEach { location ->
+                    Marker(
+                        state = MarkerState(
+                            position = LatLng(location.latitude, location.longitude)
+                        ),
+                        title = "위치 ID: ${location.id}",
+                        snippet = "시간: ${location.timestamp.toFormattedString()}"
+                    )
+                }
+            }
+
+            // '현 위치' 버튼 (하단 중앙, 지도 위에 표시되도록 패딩 추가)
+            Button(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(16.dp), // 버튼에만 패딩 적용
+                onClick = {
+                    viewModel.action(MainAction.OnFetchLocationClicked)
+                }
+            ) {
+                Text(text = "현 위치")
+            }
+
+            if (state.isLoading) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+            }
+        }
+    }
+}
+
+// Long 타임스탬프를 읽기 쉬운 문자열로 변환하는 확장 함수
+fun Long.toFormattedString(): String {
+    val sdf = SimpleDateFormat("yyyy.MM.dd HH:mm:ss", Locale.getDefault())
+    return sdf.format(Date(this))
+}
+
+// (LocationList Composable은 지도에 의해 대체되었으므로 제거)
+```
+
+### 구현 설명
+
+1.  **API 키 설정 (1-4)**: `secrets-gradle-plugin`을 설정하고 `local.properties`에 키를 추가한 뒤, Manifest에서 `${MAPS_API_KEY}`로 참조했습니다.
+2.  **라이브러리 추가 (2)**: `maps-compose` 라이브러리를 `feature` 모듈에 추가했습니다.
+3.  **`GoogleMap` Composable (7)**: `MainScreen`의 `Box` 내부에 `GoogleMap` Composable을 추가하여 화면 전체를 채우도록 했습니다.
+4.  **카메라 상태 (5)**: `rememberCameraPositionState`를 사용해 지도의 카메라 위치를 기억하고 제어할 수 있도록 했습니다.
+5.  **마커 표시 (8)**: `GoogleMap`의 컨텐츠 람다 내에서 `state.locations` 리스트를 `forEach`로 순회하며, 각 `LocationInfo` 객체에 대해 `Marker` Composable을 생성했습니다.
+6.  **카메라 이동 (6)**: `LaunchedEffect`를 사용하여 `state.locations`가 변경될 때 (즉, Room DB가 업데이트될 때) `locations` 리스트의 첫 번째(가장 최신) 항목을 찾아 카메라를 해당 위치로 부드럽게(`animate`) 이동시켰습니다.
+
+이제 요구사항의 모든 항목이 구현되었습니다.
+
+---
+
+# 질문 9
+java.lang.NullPointerException: CameraUpdateFactory is not initialized
+   at com.google.android.gms.common.internal.Preconditions.checkNotNull(com.google.android.gms:play-services-basement@@18.3.0:2)
+   at com.google.android.gms.maps.CameraUpdateFactory.zzb(com.google.android.gms:play-services-maps@@19.2.0:1)
+   at com.google.android.gms.maps.CameraUpdateFactory.newLatLngZoom(com.google.android.gms:play-services-maps@@19.2.0:2)
+   at com.kurly.feature.ui.MapScreenKt$MapScreen$2$1.invokeSuspend(MapScreen.kt:72)
+   at kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith(ContinuationImpl.kt:34)
+   at kotlinx.coroutines.DispatchedTask.run(DispatchedTask.kt:100)
+   at androidx.compose.ui.platform.AndroidUiDispatcher.performTrampolineDispatch(AndroidUiDispatcher.android.kt:79)
+   at androidx.compose.ui.platform.AndroidUiDispatcher.access$performTrampolineDispatch(AndroidUiDispatcher.android.kt:41)
+   at androidx.compose.ui.platform.AndroidUiDispatcher$dispatchCallback$1.run(AndroidUiDispatcher.android.kt:57)
+   at android.os.Handler.handleCallback(Handler.java:995)
+   at android.os.Handler.dispatchMessage(Handler.java:103)
+   at android.os.Looper.loopOnce(Looper.java:248)
+   at android.os.Looper.loop(Looper.java:338)
+   at android.app.ActivityThread.main(ActivityThread.java:9067)
+   at java.lang.reflect.Method.invoke(Native Method)
+   at com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run(RuntimeInit.java:593)
+   at com.android.internal.os.ZygoteInit.main(ZygoteInit.java:932)
+   Suppressed: kotlinx.coroutines.internal.DiagnosticCoroutineContextException: [androidx.compose.ui.platform.MotionDurationScaleImpl@fc924f2, androidx.compose.runtime.BroadcastFrameClock@712a743, StandaloneCoroutine{Cancelling}@2b9d1c0, AndroidUiDispatcher@186fef9]
+
+위와 같이 초기화 오류가 생기고 있어 어떻게 처리하면 좋을까?
+
+# 답변 9
+아, 이 에러는 매우 흔하면서도 까다로운 **'레이스 컨디션(race condition)'** 문제입니다. 😥
+
+## 1\. 🕵️‍♂️ 문제 원인
+
+스택 트레이스를 보면 `MapScreen.kt:72`에서 `CameraUpdateFactory.newLatLngZoom`을 호출하다가 `NullPointerException`이 발생했습니다.
+
+```kotlin
+// ... (이전 코드)
+// 6. DB 위치 목록(State)이 변경되면 카메라 이동 (MapScreen.kt:72 근방)
+LaunchedEffect(state.locations) {
+    state.locations.firstOrNull()?.let { latestLocation ->
+        // 💥 문제의 코드!
+        cameraPositionState.animate(
+            com.google.android.gms.maps.model.CameraUpdateFactory.newLatLngZoom(
+                LatLng(latestLocation.latitude, latestLocation.longitude), 15f
+            )
+        )
+    }
+}
+// ...
+```
+
+이 현상의 원인은 다음과 같습니다.
+
+1.  ViewModel에서 `state.locations` (DB 데이터)가 업데이트되었습니다.
+2.  `LaunchedEffect(state.locations)`가 즉시 트리거되었습니다.
+3.  `cameraPositionState.animate`를 호출하면서 `CameraUpdateFactory`를 사용했습니다.
+4.  **하지만** 이 시점에 `GoogleMap` Composable이 아직 화면에 렌더링되고 내부 Map 객체를 **초기화하는 중**이었습니다.
+5.  `CameraUpdateFactory`는 Google Map SDK가 완전히 초기화되어야 사용할 수 있는데, 아직 준비가 안 된 상태에서 호출했기 때문에 `is not initialized`라는 `NullPointerException`이 발생한 것입니다.
+
+-----
+
+## 2\. 💡 해결 방법
+
+`GoogleMap` Composable이 \*\*"맵 로드가 완료되었습니다"\*\*라는 신호를 줄 때까지 기다려야 합니다.
+
+`maps-compose` 라이브러리는 이를 위해 `onMapLoaded`라는 콜백을 제공합니다.
+
+1.  맵이 로드되었는지 추적하는 `Boolean` 상태를 하나 만듭니다.
+2.  `GoogleMap`의 `onMapLoaded` 콜백에서 이 상태를 `true`로 변경합니다.
+3.  `LaunchedEffect`가 **`state.locations`와 `isMapLoaded`** 두 가지 상태를 모두 관찰하도록 변경하고, 이펙트 내부에서 `isMapLoaded`가 `true`일 때만 카메라를 움직이도록 합니다.
+
+-----
+
+## 3\. 👨‍💻 수정된 코드 (`MainScreen.kt`)
+
+`remember` 상태 변수 추가, `onMapLoaded` 콜백 추가, `LaunchedEffect` 수정, 이렇게 세 부분이 변경되었습니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainScreen.kt
+
+package com.example.kurlytalent.feature.main
+
+import androidServices.Manifest
+import android.annotation.SuppressLint
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf // 1. mutableStateOf 임포트
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue // 1. setValue 임포트
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.kurlytalent.domain.model.LocationInfo
+import com.example.kurlytalent.mvi.effect
+import com.google.android.gms.maps.CameraUpdateFactory // 3. CameraUpdateFactory 임포트
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.Marker
+import com.google.maps.android.compose.MarkerState
+import com.google.maps.android.compose.rememberCameraPositionState
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+@SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
+@Composable
+fun MainScreen(
+    viewModel: MainViewModel = hiltViewModel()
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    // --- 1. 맵 로드 상태를 저장할 변수 추가 ---
+    var isMapLoaded by remember { mutableStateOf(false) }
+
+    // (권한 런처 및 Effect 핸들러는 동일)
+    val permissionsToRequest = arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = { permissionsMap ->
+            val isGranted = permissionsMap.values.all { it }
+            viewModel.action(MainAction.OnPermissionResult(isGranted))
+        }
+    )
+
+    scope.effect(viewModel) { effect: MainEffect ->
+        when (effect) {
+            is MainEffect.RequestLocationPermission -> {
+                locationPermissionLauncher.launch(permissionsToRequest)
+            }
+            is MainEffect.ShowErrorPopup -> {
+                scope.launch {
+                    snackbarHostState.showSnackbar(effect.message)
+                }
+            }
+        }
+    }
+
+    val cameraPositionState = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(LatLng(37.5665, 126.9780), 10f)
+    }
+
+    // --- 3. LaunchedEffect 수정 ---
+    // state.locations 뿐만 아니라 isMapLoaded 상태도 함께 관찰
+    LaunchedEffect(state.locations, isMapLoaded) {
+        // 맵이 로드되었고, 위치 데이터가 있을 때만 실행
+        if (isMapLoaded && state.locations.isNotEmpty()) {
+            state.locations.firstOrNull()?.let { latestLocation ->
+                // 이제 CameraUpdateFactory.newLatLngZoom 호출이 안전합니다.
+                cameraPositionState.animate(
+                    CameraUpdateFactory.newLatLngZoom(
+                        LatLng(latestLocation.latitude, latestLocation.longitude), 15f
+                    )
+                )
+            }
+        }
+    }
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) }
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            GoogleMap(
+                modifier = Modifier.fillMaxSize(),
+                cameraPositionState = cameraPositionState,
+                // --- 2. 맵 로드가 완료되면 상태 변경 ---
+                onMapLoaded = {
+                    isMapLoaded = true
+                }
+            ) {
+                state.locations.forEach { location ->
+                    Marker(
+                        state = MarkerState(
+                            position = LatLng(location.latitude, location.longitude)
+                        ),
+                        title = "위치 ID: ${location.id}",
+                        snippet = "시간: ${location.timestamp.toFormattedString()}"
+                    )
+                }
+            }
+
+            // (버튼 및 로딩 인디케이터는 동일)
+            Button(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                onClick = {
+                    viewModel.action(MainAction.OnFetchLocationClicked)
+                }
+            ) {
+                Text(text = "현 위치")
+            }
+
+            if (state.isLoading) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+            }
+        }
+    }
+}
+
+// (확장 함수 동일)
+fun Long.toFormattedString(): String {
+    val sdf = SimpleDateFormat("yyyy.MM.dd HH:mm:ss", Locale.getDefault())
+    return sdf.format(Date(this))
+}
+```
+
+이제 `LaunchedEffect`는 `isMapLoaded`가 `true`가 된 이후에만 카메라 애니메이션을 시도하므로, `CameraUpdateFactory`가 항상 초기화된 상태임을 보장할 수 있습니다.
+
+---
+
+# 질문 10
+위치 권한을 허용 안함으로 하는 경우 팝업이 뜨지 않는데 이러한 경우 시스템 설정으로 갈 수 있도록 하고 싶어
+
+# 답변 10
+좋은 포인트입니다\! 사용자가 권한을 '허용 안 함' (영구 거부)으로 설정한 경우, 일반 팝업 대신 시스템 설정으로 이동할 수 있도록 안내하는 것은 UX에 매우 중요합니다.
+
+이 로직을 구현하기 위해 MVI 플로우를 수정하겠습니다.
+
+1.  **MVI 수정**:
+    * `OnPermissionResult` Action이 `isGranted` 외에 `shouldShowRationale` (다시 물어볼 수 있는지 여부) 상태도 전달하도록 변경합니다.
+    * ViewModel은 `isGranted: false` 이고 `shouldShowRationale: false` (영구 거부)일 때, `GoToAppSettings`라는 새로운 Effect를 발행합니다.
+2.  **View 수정**:
+    * `rememberLauncherForActivityResult`의 `onResult` 콜백에서 `shouldShowRequestPermissionRationale`을 확인하여 ViewModel에 전달합니다.
+    * `GoToAppSettings` Effect를 수신하면, "설정으로 이동" 옵션이 있는 스낵바(또는 다이얼로그)를 띄우고, 사용자가 "설정"을 누르면 앱의 시스템 설정 화면으로 `Intent`를 실행합니다.
+
+-----
+
+## 1\. MVI 정의 수정 (`MainMVI.kt`)
+
+`OnPermissionResult` Action을 확장하고 `GoToAppSettings` Effect를 추가합니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainMVI.kt
+package com.example.kurlytalent.feature.main
+
+// ... (imports)
+
+// Actions (UI -> ViewModel)
+sealed interface MainAction : Action {
+    data object OnFetchLocationClicked : MainAction
+    /**
+     * UI에서 권한 요청 결과를 전달합니다.
+     * @param isGranted 권한 허용 여부
+     * @param shouldShowRationale 권한을 다시 요청할 수 있는지 여부 (false면 영구 거부)
+     */
+    data class OnPermissionResult(val isGranted: Boolean, val shouldShowRationale: Boolean) : MainAction
+}
+
+// ... (State는 변경 없음)
+
+// Effects (ViewModel -> UI, 일회성 이벤트)
+sealed interface MainEffect : Effect {
+    data object RequestLocationPermission : MainEffect
+    data class ShowErrorPopup(val message: String) : MainEffect
+    /**
+     * 시스템 앱 설정 화면으로 이동하도록 UI에 요청합니다.
+     */
+    data object GoToAppSettings : MainEffect
+}
+
+// ... (Reducer는 변경 없음)
+```
+
+-----
+
+## 2\. ViewModel 수정 (`MainViewModel.kt`)
+
+`OnPermissionResult` Action을 처리하는 로직을 분기합니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainViewModel.kt
+package com.example.kurlytalent.feature.main
+
+// ... (imports)
+
+@HiltViewModel
+class MainViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val enqueueLocationUpdateUseCase: EnqueueLocationUpdateUseCase,
+    private val observeLocationWorkUseCase: ObserveLocationWorkUseCase,
+    private val locationRepository: LocationRepository
+) : BaseViewModel<MainAction, MainState, MainEffect, MainReducer>(
+    initialState = MainState()
+) {
+
+    // ... (init)
+
+    override fun action(action: MainAction) {
+        when (action) {
+            is MainAction.OnFetchLocationClicked -> {
+                checkLocationPermission()
+            }
+            
+            // 2. OnPermissionResult 처리 로직 수정
+            is MainAction.OnPermissionResult -> {
+                if (action.isGranted) {
+                    // 2-1. 권한 허용됨
+                    startLocationWork()
+                } else {
+                    // 2-2. 권한 거부됨
+                    if (action.shouldShowRationale) {
+                        // 2-3. 다시 물어볼 수 있음 (단순 거부)
+                        launchInViewModelScope {
+                            emitEffect(MainEffect.ShowErrorPopup("위치 권한이 필요합니다."))
+                        }
+                    } else {
+                        // 2-4. 다시 물어볼 수 없음 (영구 거부)
+                        launchInViewModelScope {
+                            emitEffect(MainEffect.GoToAppSettings)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun checkLocationPermission() = launchInViewModelScope {
+        val finePermissionGranted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val coarsePermissionGranted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (finePermissionGranted || coarsePermissionGranted) {
+            // 1. 권한이 이미 있으면, 바로 작업 시작 (OnPermissionResult를 거치지 않음)
+            startLocationWork()
+        } else {
+            // 권한이 없으면, UI에 권한 요청 Effect 전달
+            emitEffect(MainEffect.RequestLocationPermission)
+        }
+    }
+
+    // ... (startLocationWork, observeAllLocations, onHandleException 등)
+}
+```
+
+-----
+
+## 3\. View 수정 (`MainScreen.kt`)
+
+`rememberLauncherForActivityResult`의 `onResult` 콜백과 `effect` 핸들러를 수정합니다.
+
+```kotlin
+// feature/src/main/java/com/example/kurlytalent/feature/main/MainScreen.kt
+
+package com.example.kurlytalent.feature.main
+
+import androidServices.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+// ... (other layout imports)
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult // 1. 스낵바 결과 임포트
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext // 2. LocalContext 임포트
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+// ... (domain model, mvi, map imports)
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import kotlinx.coroutines.launch
+// ... (other imports)
+
+@SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
+@Composable
+fun MainScreen(
+    viewModel: MainViewModel = hiltViewModel()
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current // 3. Context 가져오기
+
+    val permissionsToRequest = arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+
+    // 4. 권한 런처 onResult 수정
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = { permissionsMap ->
+            val isGranted = permissionsMap.values.all { it }
+            if (isGranted) {
+                // 4-1. 허용됨
+                viewModel.action(MainAction.OnPermissionResult(isGranted = true, shouldShowRationale = false))
+            } else {
+                // 4-2. 거부됨
+                // shouldShowRequestPermissionRationale을 확인하기 위해 Activity가 필요
+                val activity = context.findActivity()
+                val shouldShowRationale = if (activity != null) {
+                    // 요청한 권한 중 하나라도 '다시 물어볼 수 있는지' 확인
+                    permissionsToRequest.any {
+                        activity.shouldShowRequestPermissionRationale(it)
+                    }
+                } else {
+                    true // Activity를 찾지 못하는 예외 상황 시, 단순 거부로 처리
+                }
+                
+                viewModel.action(MainAction.OnPermissionResult(isGranted = false, shouldShowRationale = shouldShowRationale))
+            }
+        }
+    )
+
+    // 5. Effect 핸들러 수정
+    scope.effect(viewModel) { effect: MainEffect ->
+        when (effect) {
+            is MainEffect.RequestLocationPermission -> {
+                locationPermissionLauncher.launch(permissionsToRequest)
+            }
+            is MainEffect.ShowErrorPopup -> {
+                scope.launch {
+                    snackbarHostState.showSnackbar(effect.message)
+                }
+            }
+            // 5-1. GoToAppSettings Effect 처리
+            is MainEffect.GoToAppSettings -> {
+                scope.launch {
+                    val result = snackbarHostState.showSnackbar(
+                        message = "위치 권한이 영구적으로 거부되었습니다.",
+                        actionLabel = "설정으로 이동",
+                        withDismissAction = true
+                    )
+                    if (result == SnackbarResult.ActionPerformed) {
+                        // 5-2. 시스템 설정 화면으로 Intent 실행
+                        val intent = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", context.packageName, null)
+                        )
+                        context.startActivity(intent)
+                    }
+                }
+            }
+        }
+    }
+
+    // ... (맵 로드 상태 변수, LaunchedEffect, Scaffold 등 나머지 UI 코드는 동일)
+    
+    // (이하 동일)
+    val cameraPositionState = rememberCameraPositionState { /* ... */ }
+    var isMapLoaded by remember { mutableStateOf(false) }
+    LaunchedEffect(state.locations, isMapLoaded) { /* ... */ }
+    Scaffold(snackbarHost = { SnackbarHost(snackbarHostState) }) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            GoogleMap(
+                modifier = Modifier.fillMaxSize(),
+                cameraPositionState = cameraPositionState,
+                onMapLoaded = { isMapLoaded = true }
+            ) { /* ... */ }
+            Button(
+                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp),
+                onClick = { viewModel.action(MainAction.OnFetchLocationClicked) }
+            ) { /* ... */ }
+            if (state.isLoading) { /* ... */ }
+        }
+    }
+}
+
+// 6. Context에서 Activity를 찾기 위한 헬퍼 함수
+private fun Context.findActivity(): Activity? {
+    var context = this
+    while (context is ContextWrapper) {
+        if (context is Activity) return context
+        context = context.baseContext
+    }
+    return null
+}
+
+// (toFormattedString 확장 함수는 동일)
+```

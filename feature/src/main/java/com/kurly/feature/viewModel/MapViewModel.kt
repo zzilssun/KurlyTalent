@@ -36,7 +36,6 @@ internal class MapViewModel @Inject constructor(
     private var observeWorkJob: Job? = null
 
     init {
-        // ViewModel 생성 시 DB의 모든 위치 정보를 관찰 시작
         observeAllLocations()
     }
 
@@ -45,20 +44,22 @@ internal class MapViewModel @Inject constructor(
      */
     override fun action(action: MapAction) {
         when (action) {
-            // '현 위치' 버튼 클릭 시
             is MapAction.OnFetchLocationClicked -> {
                 checkLocationPermission()
             }
 
-            // UI로부터 권한 요청 결과를 받았을 때
             is MapAction.OnPermissionResult -> {
                 if (action.isGranted) {
-                    // 권한 있으면 Work 시작
                     startLocationWork()
                 } else {
-                    // 권한 없으면 에러 팝업
-                    launchInViewModelScope {
-                        emitEffect(MapEffect.ShowErrorPopup("위치 권한이 필요합니다."))
+                    if (action.shouldShowRationale) {
+                        launchInViewModelScope {
+                            emitEffect(MapEffect.ShowErrorPopup("위치 권한이 필요합니다."))
+                        }
+                    } else {
+                        launchInViewModelScope {
+                            emitEffect(MapEffect.GoToAppSettings)
+                        }
                     }
                 }
             }
@@ -77,7 +78,7 @@ internal class MapViewModel @Inject constructor(
         ) == PackageManager.PERMISSION_GRANTED
 
         if (finePermissionGranted || coarsePermissionGranted) {
-            action(MapAction.OnPermissionResult(isGranted = true))
+            startLocationWork()
         } else {
             emitEffect(MapEffect.RequestLocationPermission)
         }
@@ -89,7 +90,6 @@ internal class MapViewModel @Inject constructor(
     private fun observeAllLocations() {
         launchInViewModelScope {
             locationRepository.getAllLocations().collectLatest { locations ->
-                // DB가 변경될 때마다 State를 업데이트
                 emitReducer(MapReducer.UpdateLocations(locations))
             }
         }
