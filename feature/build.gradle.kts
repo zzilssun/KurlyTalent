@@ -36,6 +36,5 @@ dependencies {
     // Google Maps & Location
     implementation(libs.maps)
     implementation(libs.location)
-    implementation(libs.coroutines.play.services)
     implementation(libs.maps.compose)
 }

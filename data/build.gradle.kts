@@ -31,5 +31,5 @@ dependencies {
     ksp(libs.room.compiler)
 
     // Kotlin
-    implementation(libs.kotlinx.coroutines.play.services)
+    implementation(libs.coroutines.play.services)
 }
