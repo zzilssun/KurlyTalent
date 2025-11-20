@@ -26,10 +26,10 @@ class LocationWorker @AssistedInject constructor(
 
     override suspend fun doWork(): Result {
         return try {
-            val a = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-            val b = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val finePermissionGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val coarsePermissionGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
-            if (!a && !b) {
+            if (!finePermissionGranted && !coarsePermissionGranted) {
                 throw LocationException.PermissionDenied()
             }
 
