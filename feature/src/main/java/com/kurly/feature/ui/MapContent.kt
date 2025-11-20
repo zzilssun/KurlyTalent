@@ -21,12 +21,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.tooling.preview.PreviewParameter
+import androidx.compose.ui.tooling.preview.PreviewParameterProvider
 import androidx.compose.ui.unit.dp
 import com.google.android.gms.maps.model.LatLng
 import com.google.maps.android.compose.CameraPositionState
 import com.google.maps.android.compose.GoogleMap
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.MarkerState
+import com.kurly.domain.model.LocationInfo
 import com.kurly.feature.mvi.MapUiState
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -106,10 +109,12 @@ private fun Long.toFormattedString(): String {
 
 @Preview
 @Composable
-private fun PreviewMapContent() {
+private fun PreviewMapContent(
+    @PreviewParameter(PreviewMapContentProvider::class) state: MapUiState,
+) {
     Surface {
         MapContent(
-            state = MapUiState(),
+            state = state,
             snackbarHostState = SnackbarHostState(),
             cameraPositionState = remember { CameraPositionState() },
             modifier = Modifier.fillMaxSize(),
@@ -117,4 +122,22 @@ private fun PreviewMapContent() {
             onFetchLocationClick = {},
         )
     }
+}
+
+private class PreviewMapContentProvider : PreviewParameterProvider<MapUiState> {
+    override val values: Sequence<MapUiState> = sequenceOf(
+        MapUiState(
+            isLoading = true,
+        ),
+        MapUiState(
+            locations = listOf(
+                LocationInfo(
+                    id = 1,
+                    latitude = 37.5665,
+                    longitude = 126.9,
+                    timestamp = System.currentTimeMillis(),
+                ),
+            ),
+        ),
+    )
 }
